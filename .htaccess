@@ -1,0 +1,12 @@
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # 1. Keamanan: Blokir akses ke file .env dan folder sensitif
+    RewriteRule ^\.env - [F,L,NC]
+    RewriteRule ^vendor/ - [F,L,NC]
+    RewriteRule ^storage/logs/ - [F,L,NC]
+
+    # 2. Arahkan semua request ke folder public/ jika belum di dalam public/
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>
