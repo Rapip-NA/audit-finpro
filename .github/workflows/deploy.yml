@@ -1,0 +1,67 @@
+name: Deploy Laravel Project on push to cPanel
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  web-deploy:
+    name: 🚀 Build & Deploy via Secure HTTPS Webhook
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛎 Checkout code
+        uses: actions/checkout@v4
+
+      # ── PHP ──────────────────────────────────────────────────────────
+      - name: 🐘 Setup PHP 8.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, bcmath, sqlite3, pdo_sqlite, zip, curl, xml, dom, pcntl, posix, fileinfo
+          tools: composer:v2
+          coverage: none
+
+      - name: 📄 Temporary Local Env for Build
+        run: cp .env.example .env
+
+      - name: 📦 Install Composer dependencies (production)
+        run: composer install --no-dev --optimize-autoloader --no-interaction --no-progress --ignore-platform-req=php+
+        env:
+          COMPOSER_MEMORY_LIMIT: -1
+
+      # ── Node / Vite ──────────────────────────────────────────────────
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 📦 Install npm dependencies
+        run: npm install --ignore-scripts
+
+      - name: 🏗 Build Vite assets
+        run: npm run build
+
+      # ── Deploy via Webhook (Lightweight GET / No ModSecurity Block) ───
+      - name: 🚀 Trigger Deploy Webhook on Server
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN || 'rapip_deploy_secret_key_12345' }}
+        run: |
+          echo "Memicu Webhook Deploy di server..."
+          RESPONSE=$(curl -s -k "https://audit.rapipaja.my.id/deploy_hook.php?action=deploy&token=$DEPLOY_TOKEN" 2>&1 || true)
+          echo "Response dari server:"
+          echo "$RESPONSE"
+
+          if echo "$RESPONSE" | grep -qv '"status":"success"'; then
+            echo "Mencoba fallback via HTTP..."
+            RESPONSE=$(curl -s "http://audit.rapipaja.my.id/deploy_hook.php?action=deploy&token=$DEPLOY_TOKEN" 2>&1 || true)
+            echo "Response fallback:"
+            echo "$RESPONSE"
+          fi
+
+          if echo "$RESPONSE" | grep -q '"status":"success"'; then
+            echo "✅ DEPLOYMENT BERHASIL 100%!"
+          else
+            echo "⚠️ Response belum success, cek pesan di atas."
+          fi
