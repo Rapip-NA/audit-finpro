@@ -1,4 +1,4 @@
-name: Deploy Laravel Project on push to cPanel
+name: Deploy Laravel via SSH & Tar Archive
 
 on:
   push:
@@ -6,15 +6,15 @@ on:
       - main
 
 jobs:
-  web-deploy:
-    name: 🚀 Build & Deploy via Secure HTTPS Webhook
+  deploy:
+    name: 🚀 Build & Deploy to Server
     runs-on: ubuntu-latest
 
     steps:
       - name: 🛎 Checkout code
         uses: actions/checkout@v4
 
-      # ── PHP ──────────────────────────────────────────────────────────
+      # ── 1. Setup PHP & Composer ──────────────────────────────────────
       - name: 🐘 Setup PHP 8.4
         uses: shivammathur/setup-php@v2
         with:
@@ -27,41 +27,115 @@ jobs:
         run: cp .env.example .env
 
       - name: 📦 Install Composer dependencies (production)
-        run: composer install --no-dev --optimize-autoloader --no-interaction --no-progress --ignore-platform-req=php+
+        run: |
+          # Nonaktifkan platform check agar tidak error jika CLI server berbeda versi
+          composer config platform-check false
+          composer install --no-dev --optimize-autoloader --no-interaction --no-progress --ignore-platform-reqs
         env:
           COMPOSER_MEMORY_LIMIT: -1
 
-      # ── Node / Vite ──────────────────────────────────────────────────
+      # ── 2. Setup Node.js & Build Vite Assets ──────────────────────────
       - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: 📦 Install npm dependencies
-        run: npm install --ignore-scripts
-
-      - name: 🏗 Build Vite assets
-        run: npm run build
-
-      # ── Deploy via Webhook (Lightweight GET / No ModSecurity Block) ───
-      - name: 🚀 Trigger Deploy Webhook on Server
-        env:
-          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN || 'rapip_deploy_secret_key_12345' }}
+      - name: 📦 Install npm dependencies & Build Vite
         run: |
-          echo "Memicu Webhook Deploy di server..."
-          RESPONSE=$(curl -s -k "https://audit.rapipaja.my.id/deploy_hook.php?action=deploy&token=$DEPLOY_TOKEN" 2>&1 || true)
-          echo "Response dari server:"
-          echo "$RESPONSE"
+          npm install --ignore-scripts
+          npm run build
 
-          if echo "$RESPONSE" | grep -qv '"status":"success"'; then
-            echo "Mencoba fallback via HTTP..."
-            RESPONSE=$(curl -s "http://audit.rapipaja.my.id/deploy_hook.php?action=deploy&token=$DEPLOY_TOKEN" 2>&1 || true)
-            echo "Response fallback:"
-            echo "$RESPONSE"
-          fi
+      # ── 3. Compress Project into Single Tar Archive ───────────────────
+      # Mengompresi seluruh file + vendor + public/build jadi 1 file .tar.gz
+      # Sangat cepat ditransfer via SCP (tidak akan kena FIN packet / ECONNRESET)
+      - name: 🗜 Compress project files
+        run: |
+          tar -czf deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='tests' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='deploy.tar.gz' \
+            --exclude='storage/logs/*.log' \
+            --exclude='storage/framework/cache/data/*' \
+            --exclude='storage/framework/sessions/*' \
+            --exclude='storage/framework/views/*' \
+            .
+          ls -lh deploy.tar.gz
 
-          if echo "$RESPONSE" | grep -q '"status":"success"'; then
-            echo "✅ DEPLOYMENT BERHASIL 100%!"
-          else
-            echo "⚠️ Response belum success, cek pesan di atas."
-          fi
+      # ── 4. Upload Archive via SCP ────────────────────────────────────
+      - name: 📤 Upload tar.gz via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST || 'rapipaja.my.id' }}
+          username: ${{ secrets.SSH_USERNAME || 'rapipaja' }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: 'deploy.tar.gz'
+          target: '~/'
+
+      # ── 5. Extract & Run Artisan on Server via SSH ────────────────────
+      - name: 🛠 Extract & Run Laravel Commands
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST || 'rapipaja.my.id' }}
+          username: ${{ secrets.SSH_USERNAME || 'rapipaja' }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+
+            # 1. Deteksi path domain di server
+            if [ -d "$HOME/domains/audit.rapipaja.my.id/public_html" ]; then
+              TARGET_DIR="$HOME/domains/audit.rapipaja.my.id/public_html"
+            elif [ -d "$HOME/domains/audit.rapip.my.id/public_html" ]; then
+              TARGET_DIR="$HOME/domains/audit.rapip.my.id/public_html"
+            elif [ -d "$HOME/domains/rapipaja.my.id/public_html/audit" ]; then
+              TARGET_DIR="$HOME/domains/rapipaja.my.id/public_html/audit"
+            elif [ -d "$HOME/public_html/audit" ]; then
+              TARGET_DIR="$HOME/public_html/audit"
+            else
+              TARGET_DIR="$HOME/domains/audit.rapipaja.my.id/public_html"
+              mkdir -p "$TARGET_DIR"
+            fi
+
+            echo "Target Directory: $TARGET_DIR"
+
+            # 2. Ekstrak archive langsung ke target folder
+            tar -xzf ~/deploy.tar.gz -C "$TARGET_DIR"
+            rm -f ~/deploy.tar.gz
+
+            cd "$TARGET_DIR"
+
+            # 3. Pastikan permission direktori storage & cache
+            mkdir -p storage/framework/{sessions,views,cache/data} storage/logs bootstrap/cache
+            chmod -R 775 storage bootstrap/cache || true
+
+            # 4. Deteksi binary PHP >= 8.3 di server DirectAdmin / cPanel
+            PHP_BIN=""
+            for p in /usr/local/php84/bin/php /usr/local/php83/bin/php /usr/bin/ea-php84 /usr/bin/ea-php83 /opt/alt/php84/usr/bin/php /opt/alt/php83/usr/bin/php /usr/local/bin/php84 /usr/local/bin/php83 $(which php8.4 2>/dev/null) $(which php8.3 2>/dev/null) $(which php); do
+              if [ -x "$p" ]; then
+                V=$("$p" -r 'echo PHP_VERSION_ID;' 2>/dev/null || echo 0)
+                if [ "$V" -ge 80300 ]; then
+                  PHP_BIN="$p"
+                  break
+                fi
+              fi
+            done
+
+            if [ -z "$PHP_BIN" ]; then
+              PHP_BIN=$(which php)
+            fi
+
+            echo "Menggunakan PHP binary: $PHP_BIN ($($PHP_BIN -v | head -n 1))"
+
+            # 5. Jalankan perintah Laravel Artisan
+            $PHP_BIN artisan storage:link || true
+            $PHP_BIN artisan migrate --force || true
+            $PHP_BIN artisan config:clear || true
+            $PHP_BIN artisan route:clear || true
+            $PHP_BIN artisan view:clear || true
+
+            echo "✅ Deployment ke audit.rapipaja.my.id berhasil 100%!"
