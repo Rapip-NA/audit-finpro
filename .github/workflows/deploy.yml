@@ -28,7 +28,6 @@ jobs:
 
       - name: 📦 Install Composer dependencies (production)
         run: |
-          # Nonaktifkan platform check agar tidak error jika CLI server berbeda versi
           composer config platform-check false
           composer install --no-dev --optimize-autoloader --no-interaction --no-progress --ignore-platform-reqs
         env:
@@ -46,23 +45,18 @@ jobs:
           npm run build
 
       # ── 3. Compress Project into Single Tar Archive ───────────────────
-      # Mengompresi seluruh file + vendor + public/build jadi 1 file .tar.gz
-      # Sangat cepat ditransfer via SCP (tidak akan kena FIN packet / ECONNRESET)
+      # Simpan di /tmp agar tidak bentrok dengan pembacaan folder direktori saat ini
       - name: 🗜 Compress project files
         run: |
-          tar -czf deploy.tar.gz \
+          tar -czf /tmp/deploy.tar.gz \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='node_modules' \
             --exclude='tests' \
             --exclude='.env' \
             --exclude='.env.*' \
-            --exclude='deploy.tar.gz' \
-            --exclude='storage/logs/*.log' \
-            --exclude='storage/framework/cache/data/*' \
-            --exclude='storage/framework/sessions/*' \
-            --exclude='storage/framework/views/*' \
             .
+          mv /tmp/deploy.tar.gz ./deploy.tar.gz
           ls -lh deploy.tar.gz
 
       # ── 4. Upload Archive via SCP ────────────────────────────────────
@@ -74,7 +68,7 @@ jobs:
           password: ${{ secrets.SSH_PASSWORD }}
           port: ${{ secrets.SSH_PORT || 22 }}
           source: 'deploy.tar.gz'
-          target: '~/'
+          target: '/home/rapipaja'
 
       # ── 5. Extract & Run Artisan on Server via SSH ────────────────────
       - name: 🛠 Extract & Run Laravel Commands
@@ -87,33 +81,51 @@ jobs:
           script: |
             set -e
 
-            # 1. Deteksi path domain di server
-            if [ -d "$HOME/domains/audit.rapipaja.my.id/public_html" ]; then
-              TARGET_DIR="$HOME/domains/audit.rapipaja.my.id/public_html"
-            elif [ -d "$HOME/domains/audit.rapip.my.id/public_html" ]; then
-              TARGET_DIR="$HOME/domains/audit.rapip.my.id/public_html"
-            elif [ -d "$HOME/domains/rapipaja.my.id/public_html/audit" ]; then
-              TARGET_DIR="$HOME/domains/rapipaja.my.id/public_html/audit"
-            elif [ -d "$HOME/public_html/audit" ]; then
-              TARGET_DIR="$HOME/public_html/audit"
-            else
-              TARGET_DIR="$HOME/domains/audit.rapipaja.my.id/public_html"
-              mkdir -p "$TARGET_DIR"
+            # 1. Cari file archive deploy.tar.gz
+            ARCHIVE=""
+            for a in /home/rapipaja/deploy.tar.gz "$HOME/deploy.tar.gz" ./deploy.tar.gz; do
+              if [ -f "$a" ]; then
+                ARCHIVE="$a"
+                break
+              fi
+            done
+
+            if [ -z "$ARCHIVE" ]; then
+              echo "❌ File deploy.tar.gz tidak ditemukan di server!"
+              exit 1
             fi
 
-            echo "Target Directory: $TARGET_DIR"
+            echo "📦 Ditemukan archive: $ARCHIVE"
 
-            # 2. Ekstrak archive langsung ke target folder
-            tar -xzf ~/deploy.tar.gz -C "$TARGET_DIR"
-            rm -f ~/deploy.tar.gz
+            # 2. Target folder sesuai domain di server DirectAdmin / cPanel
+            TARGET_DIR="/home/rapipaja/domains/audit.rapipaja.my.id/public_html"
+            if [ ! -d "$TARGET_DIR" ]; then
+              if [ -d "$HOME/domains/audit.rapipaja.my.id/public_html" ]; then
+                TARGET_DIR="$HOME/domains/audit.rapipaja.my.id/public_html"
+              else
+                mkdir -p "$TARGET_DIR"
+              fi
+            fi
+
+            echo "📂 Target Directory: $TARGET_DIR"
+
+            # 3. Ekstrak archive langsung ke target folder
+            tar -xzf "$ARCHIVE" -C "$TARGET_DIR"
+            rm -f "$ARCHIVE"
 
             cd "$TARGET_DIR"
 
-            # 3. Pastikan permission direktori storage & cache
+            # 4. Pastikan file .env ada
+            if [ ! -f .env ] && [ -f .env.example ]; then
+              cp .env.example .env
+              echo "📄 Dibuat file .env baru dari .env.example"
+            fi
+
+            # 5. Pastikan folder storage & cache ada serta memiliki permission
             mkdir -p storage/framework/{sessions,views,cache/data} storage/logs bootstrap/cache
             chmod -R 775 storage bootstrap/cache || true
 
-            # 4. Deteksi binary PHP >= 8.3 di server DirectAdmin / cPanel
+            # 6. Deteksi binary PHP >= 8.3 di server
             PHP_BIN=""
             for p in /usr/local/php84/bin/php /usr/local/php83/bin/php /usr/bin/ea-php84 /usr/bin/ea-php83 /opt/alt/php84/usr/bin/php /opt/alt/php83/usr/bin/php /usr/local/bin/php84 /usr/local/bin/php83 $(which php8.4 2>/dev/null) $(which php8.3 2>/dev/null) $(which php); do
               if [ -x "$p" ]; then
@@ -129,13 +141,13 @@ jobs:
               PHP_BIN=$(which php)
             fi
 
-            echo "Menggunakan PHP binary: $PHP_BIN ($($PHP_BIN -v | head -n 1))"
+            echo "🐘 PHP binary: $PHP_BIN ($($PHP_BIN -v | head -n 1))"
 
-            # 5. Jalankan perintah Laravel Artisan
+            # 7. Jalankan Artisan
             $PHP_BIN artisan storage:link || true
             $PHP_BIN artisan migrate --force || true
             $PHP_BIN artisan config:clear || true
             $PHP_BIN artisan route:clear || true
             $PHP_BIN artisan view:clear || true
 
-            echo "✅ Deployment ke audit.rapipaja.my.id berhasil 100%!"
+            echo "✅ DEPLOYMENT BERHASIL! File telah masuk ke $TARGET_DIR"
